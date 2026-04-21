@@ -230,46 +230,92 @@ class RedLightViolationDetector:
         # Check for violations
         is_red = self.is_red_light(cap)
         active_vehicles = 0
-        
-        # Handle both tracking and detection modes
-        if is_red and hasattr(results[0].boxes, 'id') and results[0].boxes.id is not None:
-            # Tracking mode - use vehicle IDs
+
+        # --- BUG FIX 1 ---
+        # Always track vehicle positions on EVERY frame, not just during red.
+        # If we only track during red, vehicles that crossed JUST as red started
+        # never accumulate 2 history entries and are never flagged.
+        has_tracking_ids = hasattr(results[0].boxes, 'id') and results[0].boxes.id is not None
+
+        if has_tracking_ids:
+            # Tracking mode — always update Y-history regardless of light state
             for box in results[0].boxes:
                 vehicle_id = int(box.id)
                 active_vehicles += 1
-                
+
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                start_y = y2 - 20
-                
-                self.object_y_hist[vehicle_id].append(start_y)
-                
-                if len(self.object_y_hist[vehicle_id]) >= 2:
+                # Use bottom-center of bounding box as reference point
+                ref_y = y2
+
+                self.object_y_hist[vehicle_id].append(ref_y)
+                # Keep history short to save memory
+                if len(self.object_y_hist[vehicle_id]) > 10:
+                    self.object_y_hist[vehicle_id].pop(0)
+
+                # Only flag violations when red light is active
+                if is_red and len(self.object_y_hist[vehicle_id]) >= 2:
                     prev_y = self.object_y_hist[vehicle_id][-2]
                     curr_y = self.object_y_hist[vehicle_id][-1]
-                    
-                    # Check if line crossed
+
                     line_y_threshold = self.config.get('line_y_threshold', 310)
-                    if (prev_y < line_y_threshold and 
-                        curr_y >= line_y_threshold and 
-                        vehicle_id not in self.saved_ids):
-                        
+
+                    # --- BUG FIX 2 ---
+                    # Original: prev_y < threshold AND curr_y >= threshold
+                    # Problem: if vehicle starts the RED phase already BELOW the line
+                    # (curr_y already >= threshold from prior frames), this condition
+                    # is never satisfied.
+                    # Fix: also catch vehicles that are ALREADY past the line at red start
+                    # by checking if their CURRENT position is past the line and they
+                    # haven't been saved yet.
+                    crossed_line = (prev_y < line_y_threshold and curr_y >= line_y_threshold)
+                    already_past_line = (curr_y >= line_y_threshold and len(self.object_y_hist[vehicle_id]) == 2)
+
+                    if (crossed_line or already_past_line) and vehicle_id not in self.saved_ids:
                         self.violation_timers[vehicle_id] = 0
                         self.save_violation_image(frame_resized, box.xyxy[0], vehicle_id)
                         self.saved_ids.add(vehicle_id)
-                
-                # Flash violation indicator
+                        logger.info(f"🚨 Violation detected! Vehicle ID: {vehicle_id}, Y: {curr_y}, threshold: {line_y_threshold}")
+
+                # Flash red box on violating vehicle
                 if self.should_flash_vehicle(vehicle_id):
                     cv.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 0, 255), 4)
-                    cv.putText(annotated_frame, "VIOLATION!", (x2-80, y2+25), 
-                              cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    cv.putText(annotated_frame, "VIOLATION!", (x1, y1 - 10),
+                              cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
         else:
-            # Detection-only mode - count all detected vehicles
-            if is_red and results[0].boxes is not None:
+            # Detection-only mode (no persistent tracking IDs)
+            # Count vehicles and use positional tracking with grid cells
+            if results[0].boxes is not None:
+                line_y_threshold = self.config.get('line_y_threshold', 310)
                 for box in results[0].boxes:
                     active_vehicles += 1
-                    # Draw bounding box for all detected vehicles
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    cv.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    ref_y = y2
+
+                    # Use a grid-cell key as a pseudo-ID for detection-only mode
+                    cell_key = (x1 // 80, y1 // 80)
+                    self.object_y_hist[cell_key].append(ref_y)
+                    if len(self.object_y_hist[cell_key]) > 10:
+                        self.object_y_hist[cell_key].pop(0)
+
+                    if is_red:
+                        cv.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                        if len(self.object_y_hist[cell_key]) >= 2:
+                            prev_y = self.object_y_hist[cell_key][-2]
+                            curr_y = self.object_y_hist[cell_key][-1]
+                            crossed = (prev_y < line_y_threshold and curr_y >= line_y_threshold)
+                            already_past = (curr_y >= line_y_threshold and len(self.object_y_hist[cell_key]) == 2)
+                            if (crossed or already_past) and cell_key not in self.saved_ids:
+                                self.violation_timers[cell_key] = 0
+                                self.save_violation_image(frame_resized, box.xyxy[0], str(cell_key))
+                                self.saved_ids.add(cell_key)
+                                logger.info(f"🚨 Violation (detection mode) at cell {cell_key}, Y: {curr_y}")
+
+                        if self.should_flash_vehicle(cell_key):
+                            cv.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 0, 255), 4)
+                            cv.putText(annotated_frame, "VIOLATION!", (x1, y1 - 10),
+                                      cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
         # Draw traffic light and stats
         annotated_frame = self.draw_traffic_light(annotated_frame, is_red)
