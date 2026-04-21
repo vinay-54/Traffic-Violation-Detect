@@ -470,7 +470,7 @@ def main():
             df_stats['timestamp'] = pd.date_range(
                 start=datetime.now() - timedelta(seconds=len(df_stats)),
                 periods=len(df_stats),
-                freq='S'
+                freq='s'
             )
             
             fig = px.line(df_stats, x='timestamp', y='violations', 
